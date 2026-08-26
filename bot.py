@@ -808,7 +808,7 @@ def lang_keyboard(current):
     return json.dumps({"inline_keyboard": [row]})
 
 
-def set_lang(token, state, chat_id, lang, message_id=None, callback_id=None):
+def set_lang(token, state, chat_id, lang, message_id=None, callback_id=None, dedup=None):
     """Ставит язык подписчику. Возвращает True — список изменился."""
     subs = state["subscribers"]
     key = str(chat_id)
@@ -822,17 +822,32 @@ def set_lang(token, state, chat_id, lang, message_id=None, callback_id=None):
     if callback_id:
         answer_callback(token, callback_id, text)
     # Переписываем то же сообщение, чтобы галочка переехала на выбранную кнопку.
-    if message_id and edit_plain(token, chat_id, message_id, text,
-                                 markup=lang_keyboard(lang)):
-        pass
-    else:
-        send_plain(token, chat_id, text, markup=lang_keyboard(lang))
+    # Правка существующего сообщения чат не засоряет, поэтому её не ограничиваем;
+    # а вот новое сообщение шлём не чаще одного за прогон.
+    if not (message_id and edit_plain(token, chat_id, message_id, text,
+                                      markup=lang_keyboard(lang))):
+        if dedup is None or once(dedup, chat_id, "lang_set"):
+            send_plain(token, chat_id, text, markup=lang_keyboard(lang))
     log(f"  [~] {chat_id} → язык {lang}")
     return True
 
 
-def handle_command(token, state, chat_id, text, sender, chat_title=None):
+def once(dedup, chat_id, tag):
+    """Один ответ каждого вида на чат за прогон.
+
+    Если человек в ожидании реакции нажал кнопку пять раз, все пять нажатий
+    приедут одной пачкой — отвечать на каждое значит завалить ему чат.
+    """
+    key = (str(chat_id), tag)
+    if key in dedup:
+        return False
+    dedup.add(key)
+    return True
+
+
+def handle_command(token, state, chat_id, text, sender, chat_title=None, dedup=None):
     """Обрабатывает одну команду. Возвращает True, если список изменился."""
+    dedup = dedup if dedup is not None else set()
     subs = state["subscribers"]
     key = str(chat_id)
     known = subs.get(key)
@@ -845,34 +860,40 @@ def handle_command(token, state, chat_id, text, sender, chat_title=None):
 
     if cmd == "/start":
         if known:
-            send_plain(token, chat_id, S["already"])
+            if once(dedup, chat_id, "already"):
+                send_plain(token, chat_id, S["already"], markup=lang_keyboard(lang))
             return False
         entry = {"lang": lang, "added": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
         if STORE_NAMES:
             entry["name"] = chat_title or (sender or {}).get("first_name") or ""
         subs[key] = entry
-        send_plain(token, chat_id, S["hello"], markup=lang_keyboard(lang))
+        if once(dedup, chat_id, "hello"):
+            send_plain(token, chat_id, S["hello"], markup=lang_keyboard(lang))
         log(f"  [+] подписался {chat_id} ({lang})")
         return True
 
     if cmd == "/stop":
         if not known:
-            send_plain(token, chat_id, S["not_subscribed"])
+            if once(dedup, chat_id, "not_subscribed"):
+                send_plain(token, chat_id, S["not_subscribed"])
             return False
         subs.pop(key, None)
-        send_plain(token, chat_id, S["bye"])
+        if once(dedup, chat_id, "bye"):
+            send_plain(token, chat_id, S["bye"])
         log(f"  [-] отписался {chat_id}")
         return True
 
     if cmd == "/lang":
         # Без аргумента — просто показываем кнопки.
         if arg not in STRINGS:
-            send_plain(token, chat_id, S["choose_lang"], markup=lang_keyboard(lang))
+            if once(dedup, chat_id, "choose_lang"):
+                send_plain(token, chat_id, S["choose_lang"], markup=lang_keyboard(lang))
             return False
-        return set_lang(token, state, chat_id, arg)
+        return set_lang(token, state, chat_id, arg, dedup=dedup)
 
     if cmd in ("/help", "/помощь"):
-        send_plain(token, chat_id, S["help"])
+        if once(dedup, chat_id, "help"):
+            send_plain(token, chat_id, S["help"])
         return False
 
     return False
@@ -891,6 +912,7 @@ def poll(token, state):
 
     changed = False
     last_id = None
+    dedup = set()
     for upd in updates:
         last_id = upd.get("update_id", last_id)
 
@@ -905,7 +927,7 @@ def poll(token, state):
                 if code in STRINGS:
                     if set_lang(token, state, chat_id, code,
                                 message_id=msg.get("message_id"),
-                                callback_id=cb.get("id")):
+                                callback_id=cb.get("id"), dedup=dedup):
                         changed = True
                 else:
                     answer_callback(token, cb.get("id"))
@@ -931,7 +953,7 @@ def poll(token, state):
             continue
         chat = msg.get("chat") or {}
         if handle_command(token, state, chat.get("id"), text,
-                          msg.get("from"), chat.get("title")):
+                          msg.get("from"), chat.get("title"), dedup=dedup):
             changed = True
 
     if last_id is not None:
@@ -939,6 +961,24 @@ def poll(token, state):
         changed = True
 
     return changed
+
+
+def confirm_offset(token, state):
+    """Сообщает Telegram, что апдейты обработаны, и он их удаляет у себя.
+
+    Ключевой момент: без этого единственная защита от повтора — offset в файле.
+    Стоит коммиту не пройти, и следующий запуск заберёт те же апдейты снова
+    и ответит на них по второму разу. Именно так чат и завалило дублями.
+    Вызывать нужно после успешного сохранения файла.
+    """
+    offset = state.get("offset", 0)
+    if not offset:
+        return
+    try:
+        tg_api(token, "getUpdates", {"offset": offset, "limit": 1, "timeout": 0})
+        log(f"[i] Telegram подтвердил обработку до offset {offset}")
+    except TelegramError as exc:
+        log(f"[!] не подтвердить offset: {exc}")
 
 
 def broadcast(token, state, extra_chat_id=None, forced_lang=None):
@@ -1044,6 +1084,9 @@ def main(argv):
         before = len(state["subscribers"])
         if poll(token, state):
             save_state(state)
+            # Только после того, как список лёг на диск: если сохранение упадёт,
+            # апдейты останутся у Telegram и обработаются на следующем запуске.
+            confirm_offset(token, state)
         log(f"[ok] подписчиков: {before} → {len(state['subscribers'])}")
         return 0
 

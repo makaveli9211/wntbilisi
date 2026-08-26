@@ -231,10 +231,15 @@ class FakeTelegram:
         self.markups = {}               # chat_id -> [reply_markup, ...]
         self.edits = []                 # (chat_id, message_id, text, markup)
         self.answered = []              # callback_query_id
+        self.confirmed = []             # offset, подтверждённый в Telegram
         self.edit_fails = False
 
     def __call__(self, token, method, payload):
         if method == "getUpdates":
+            # limit=1 без allowed_updates — это подтверждение обработки, не выборка
+            if payload.get("limit") == 1 and "allowed_updates" not in payload:
+                self.confirmed.append(payload["offset"])
+                return {"ok": True, "result": []}
             batch, self.updates = self.updates, []
             return {"ok": True, "result": batch}
         if method == "sendMessage":
@@ -368,6 +373,57 @@ def subscription_checks(problems):
         print(f"  {'✓' if ok else '✗'} {name}")
         if not ok:
             problems.append(f"[подписка] провалена проверка: {name}")
+
+    print("\n[дубли] человек нажал кнопку пять раз подряд")
+
+    state = {"offset": 0, "subscribers": {}}
+    tg = FakeTelegram([
+        msg_update(30, 888, "/start"),
+        msg_update(31, 888, "/start"),       # ещё раз, не дождавшись ответа
+        msg_update(32, 888, "/lang"),        # тапнул «Меню → язык»
+        msg_update(33, 888, "/lang"),
+        msg_update(34, 888, "/lang"),
+        button_update(35, 888, "lang:ru", message_id=600),
+        button_update(36, 888, "lang:ru", message_id=600),
+        button_update(37, 888, "lang:ru", message_id=600),
+    ])
+    bot.tg_api = tg
+    bot.poll("token", state)
+    replies = tg.replies.get("888", [])
+
+    checks = {
+        "приветствие одно": sum("подписаны 👋" in r for r in replies) == 1,
+        "«уже подписаны» один раз": sum(r == bot.STRINGS["ka"]["already"]
+                                        or r == bot.STRINGS["ru"]["already"]
+                                        for r in replies) <= 1,
+        "выбор языка предложен один раз": sum(r in (bot.STRINGS["ru"]["choose_lang"],
+                                                    bot.STRINGS["ka"]["choose_lang"])
+                                              for r in replies) == 1,
+        "новых сообщений всего не больше трёх": len(replies) <= 3,
+        "каждое нажатие кнопки подтверждено": {"cb35", "cb36", "cb37"} <= set(tg.answered),
+        "повторные нажатия только правят сообщение": len(tg.edits) == 3,
+        "язык в итоге верный": state["subscribers"]["888"]["lang"] == "ru",
+    }
+    for name, ok in checks.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+        if not ok:
+            problems.append(f"[дубли] провалена проверка: {name}")
+
+    print("\n[подтверждение] offset уходит в Telegram")
+    tg = FakeTelegram()
+    bot.tg_api = tg
+    bot.confirm_offset("token", {"offset": 42, "subscribers": {}})
+    ok = tg.confirmed == [42]
+    print(f"  {'✓' if ok else '✗'} Telegram получил offset и удалит апдейты у себя")
+    if not ok:
+        problems.append("[подтверждение] offset не подтверждён")
+    tg2 = FakeTelegram()
+    bot.tg_api = tg2
+    bot.confirm_offset("token", {"offset": 0, "subscribers": {}})
+    if not tg2.confirmed:
+        print("  ✓ на пустом offset лишний запрос не шлётся")
+    else:
+        problems.append("[подтверждение] лишний запрос на пустом offset")
 
     print("\n[рассылка] отправка по списку")
 
