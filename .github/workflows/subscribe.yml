@@ -1,0 +1,81 @@
+name: Приём подписчиков
+
+# Забирает из Telegram команды /start, /stop, /lang и нажатия кнопок,
+# обновляет subscribers.json прямо в репозитории.
+# Telegram хранит непрочитанные апдейты около 24 часов — потерять ничего нельзя,
+# частота влияет только на то, как быстро человек увидит ответ бота.
+#
+# Сколько это стоит бесплатных минут (GitHub округляет каждый запуск до минуты):
+#   "*/5  * * * *"  каждые 5 минут   ~8600 мин/мес — ТОЛЬКО публичный репозиторий
+#   "*/15 * * * *"  каждые 15 минут  ~2900 мин/мес — только публичный
+#   "*/30 * * * *"  каждые 30 минут  ~1450 мин/мес — влезает в бесплатные 2000
+#   "0    * * * *"  раз в час         ~720 мин/мес — с большим запасом
+# В публичном репозитории минуты не тратятся вообще, ставьте */5.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write        # нужен, чтобы закоммитить обновлённый список
+
+# Общая группа с рассылкой: два workflow никогда не пишут в репозиторий разом.
+concurrency:
+  group: telegram-bot-state
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Опросить Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python bot.py --poll
+
+      - name: Сохранить список подписчиков
+        run: |
+          set -e
+          if git diff --quiet -- subscribers.json; then
+            echo "изменений нет"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Список подписчиков — генерируемый файл, текстовое слияние для него
+          # бессмысленно. Поэтому: забираем версию из репозитория, объединяем
+          # списки по смыслу и кладём результат ровно поверх удалённой ветки.
+          # Конфликт при таком порядке невозможен.
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git show origin/main:subscribers.json > /tmp/remote.json 2>/dev/null \
+              || echo '{}' > /tmp/remote.json
+            python bot.py --merge /tmp/remote.json
+
+            git reset --mixed origin/main >/dev/null
+            git add subscribers.json
+            if git diff --cached --quiet; then
+              echo "после слияния коммитить нечего"
+              exit 0
+            fi
+            git commit -m "Обновление списка подписчиков"
+
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push не прошёл (попытка $attempt), пробую ещё раз"
+            sleep 5
+          done
+
+          echo "не удалось сохранить список после трёх попыток"
+          exit 1
