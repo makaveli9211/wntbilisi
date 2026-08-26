@@ -119,6 +119,22 @@ FEEDS = {
 
 RATE_CODES = ("USD", "EUR", "RUB")
 
+# --- футбол ---
+# Данные берутся с football-data.org: бесплатный навсегда тариф, 12 турниров,
+# 10 запросов в минуту. Ключ кладётся в секрет FOOTBALL_API_TOKEN.
+# Нет ключа — блок просто не появляется в сводке.
+#
+# Коды турниров бесплатного тарифа:
+#   CL  Лига чемпионов        PL   Премьер-лига (Англия)
+#   PD  Ла Лига (Испания)     SA   Серия A (Италия)
+#   BL1 Бундеслига            FL1  Лига 1 (Франция)
+#   PPL Примейра (Португалия) DED  Эредивизи (Нидерланды)
+#   ELC Чемпионшип (Англия)   BSA  Бразилейрао
+#   WC  Чемпионат мира        EC   Чемпионат Европы
+FOOTBALL_COMPETITIONS = ["CL", "PL", "PD", "SA", "BL1", "FL1"]
+FOOTBALL_MAX = 12          # сколько матчей показывать максимум
+FOOTBALL_HOURS_BACK = 36   # окно, за которое считаем матч «вчерашним»
+
 # ============================================================================
 # Локализация
 # ============================================================================
@@ -159,6 +175,13 @@ STRINGS = {
                  "/start — подписаться\n"
                  "/stop — отписаться\n"
                  "/lang ru | ka — язык сводки"),
+        "football": "⚽️ Футбол — вчера",
+        "competitions": {
+            "CL": "Лига чемпионов", "PL": "Премьер-лига", "PD": "Ла Лига",
+            "SA": "Серия A", "BL1": "Бундеслига", "FL1": "Лига 1",
+            "PPL": "Примейра-лига", "DED": "Эредивизи", "ELC": "Чемпионшип",
+            "BSA": "Бразилейрао", "WC": "Чемпионат мира", "EC": "Чемпионат Европы",
+        },
         "sections": {
             "world": "📰 Главное в мире",
             "georgia": "🇬🇪 Грузия",
@@ -212,6 +235,13 @@ STRINGS = {
                  "/start — გამოწერა\n"
                  "/stop — გამოწერის გაუქმება\n"
                  "/lang ru | ka — შეჯამების ენა"),
+        "football": "⚽️ ფეხბურთი — გუშინ",
+        "competitions": {
+            "CL": "ჩემპიონთა ლიგა", "PL": "პრემიერ ლიგა", "PD": "ლა ლიგა",
+            "SA": "სერია A", "BL1": "ბუნდესლიგა", "FL1": "ლიგა 1",
+            "PPL": "პრიმეირა ლიგა", "DED": "ერედივიზი", "ELC": "ჩემპიონშიპი",
+            "BSA": "ბრაზილეირაო", "WC": "მსოფლიო ჩემპიონატი", "EC": "ევროპის ჩემპიონატი",
+        },
         "sections": {
             "world": "📰 დღის მთავარი ამბები",
             "georgia": "🇬🇪 საქართველო",
@@ -273,20 +303,19 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def fetch(url, timeout=HTTP_TIMEOUT, retries=2):
+def fetch(url, timeout=HTTP_TIMEOUT, retries=2, headers=None):
     """GET с ретраями. Возвращает bytes или бросает исключение."""
     last = None
     ctx = ssl.create_default_context()
+    base = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "ka,ru,en;q=0.8",
+    }
+    base.update(headers or {})
     for attempt in range(retries + 1):
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "*/*",
-                    "Accept-Language": "ka,ru,en;q=0.8",
-                },
-            )
+            req = urllib.request.Request(url, headers=base)
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 return resp.read()
         except Exception as exc:  # noqa: BLE001
@@ -487,6 +516,75 @@ def format_rates(rates, S):
 
 
 # ============================================================================
+# Футбол (football-data.org)
+# ============================================================================
+
+
+def get_football(now):
+    """Вчерашние завершённые матчи топ-лиг. Без ключа возвращает пустой список."""
+    token = os.environ.get("FOOTBALL_API_TOKEN", "").strip()
+    if not token:
+        return []
+
+    # Берём окно вчера–сегодня: матч, начавшийся поздно вечером, по UTC
+    # мог уже уехать на следующую дату.
+    day_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_to = now.strftime("%Y-%m-%d")
+    params = {
+        "competitions": ",".join(FOOTBALL_COMPETITIONS),
+        "dateFrom": day_from,
+        "dateTo": day_to,
+        "status": "FINISHED",
+    }
+    url = "https://api.football-data.org/v4/matches?" + urllib.parse.urlencode(params)
+    data = json.loads(fetch(url, headers={"X-Auth-Token": token}).decode("utf-8", "replace"))
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FOOTBALL_HOURS_BACK)
+    out = []
+    for m in data.get("matches", []):
+        score = ((m.get("score") or {}).get("fullTime") or {})
+        if score.get("home") is None or score.get("away") is None:
+            continue
+        try:
+            when = datetime.fromisoformat((m.get("utcDate") or "").replace("Z", "+00:00"))
+        except ValueError:
+            when = None
+        if when and when < cutoff:
+            continue
+        comp = m.get("competition") or {}
+        out.append({
+            "code": comp.get("code") or "",
+            "competition": comp.get("name") or "",
+            "home": (m.get("homeTeam") or {}).get("shortName")
+                    or (m.get("homeTeam") or {}).get("name") or "?",
+            "away": (m.get("awayTeam") or {}).get("shortName")
+                    or (m.get("awayTeam") or {}).get("name") or "?",
+            "hg": score["home"],
+            "ag": score["away"],
+            "when": when,
+        })
+
+    out.sort(key=lambda x: (FOOTBALL_COMPETITIONS.index(x["code"])
+                            if x["code"] in FOOTBALL_COMPETITIONS else 99,
+                            x["when"] or datetime.min.replace(tzinfo=timezone.utc)))
+    return out[:FOOTBALL_MAX]
+
+
+def format_football(matches, S):
+    if not matches:
+        return None
+    lines = [f"<b>{esc(S['football'])}</b>"]
+    current = None
+    for m in matches:
+        name = S["competitions"].get(m["code"]) or m["competition"]
+        if name != current:
+            current = name
+            lines.append(f"<i>{esc(name)}</i>")
+        lines.append(f"{esc(m['home'])} <b>{m['hg']}:{m['ag']}</b> {esc(m['away'])}")
+    return "\n".join(lines)
+
+
+# ============================================================================
 # Новости
 # ============================================================================
 
@@ -652,6 +750,13 @@ def build_message(lang=DEFAULT_LANG, now=None):
             block = (block + "\n" + rates_line) if block else rates_line
         if block:
             blocks.append(block)
+
+    try:
+        block = format_football(get_football(now), S)
+        if block:
+            blocks.append(block)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[!] футбол не получен: {exc}")
 
     msg = "\n\n".join(blocks)
     if len(msg) > 4000:
@@ -1060,6 +1165,25 @@ def main(argv):
             log("Нужен TELEGRAM_BOT_TOKEN")
             return 2
         return whoami(token)
+
+    # Аварийный слив: выбросить всё, что накопилось у Telegram, ничего не отвечая.
+    # Нужен, если backlog успел раздуться и на него не хочется реагировать вовсе.
+    if "--drain" in argv:
+        if not token:
+            log("Нужен TELEGRAM_BOT_TOKEN")
+            return 2
+        res = tg_api(token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
+        items = res.get("result", [])
+        if not items:
+            log("[ok] очередь и так пуста")
+            return 0
+        last = items[-1]["update_id"]
+        tg_api(token, "getUpdates", {"offset": last + 1, "limit": 1, "timeout": 0})
+        state = load_state()
+        state["offset"] = last + 1
+        save_state(state)
+        log(f"[ok] очередь очищена, offset выставлен на {last + 1}")
+        return 0
 
     # Слияние с версией файла из репозитория (вызывается из workflow перед коммитом).
     if "--merge" in argv:
