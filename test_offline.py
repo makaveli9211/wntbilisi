@@ -6,11 +6,13 @@
 """
 
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 
 import bot
+import football
 
 # ---------------------------------------------------------------- фикстуры --
 
@@ -66,6 +68,34 @@ ATOM = ("""<?xml version="1.0" encoding="utf-8"?>
 <published>%s</published></entry></feed>"""
         % datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")).encode()
 
+def match(code, comp, home, away, hg, ag, hours_ago=14):
+    when = (datetime.now(timezone.utc) - timedelta(hours=hours_ago))
+    return {
+        "utcDate": when.isoformat().replace("+00:00", "Z"),
+        "status": "FINISHED",
+        "competition": {"code": code, "name": comp},
+        "homeTeam": {"shortName": home, "name": home + " FC"},
+        "awayTeam": {"shortName": away, "name": away + " FC"},
+        "score": {"fullTime": {"home": hg, "away": ag}},
+    }
+
+
+FOOTBALL = {"matches": [
+    match("PL", "Premier League", "Arsenal", "Chelsea", 2, 1),
+    match("PL", "Premier League", "Liverpool", "Everton", 0, 0, hours_ago=16),
+    match("CL", "UEFA Champions League", "Real Madrid", "Bayern", 3, 2, hours_ago=13),
+    match("SA", "Serie A", "Inter", "Milan", 1, 2, hours_ago=15),
+    # позавчерашний — не должен попасть
+    match("PD", "La Liga", "СТАРЫЙ", "МАТЧ", 9, 9, hours_ago=50),
+    # турнир вне нашего списка — фильтруем у себя, раз API этого не умеет
+    match("ELC", "Championship", "ЛИШНИЙ", "ТУРНИР", 4, 4),
+    # ещё не доигран — счёта нет
+    {"utcDate": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+     "status": "FINISHED", "competition": {"code": "PL", "name": "Premier League"},
+     "homeTeam": {"shortName": "БЕЗ"}, "awayTeam": {"shortName": "СЧЁТА"},
+     "score": {"fullTime": {"home": None, "away": None}}},
+]}
+
 COMMON = {
     "open-meteo": json.dumps(WEATHER).encode(),
     "nbg.gov.ge": json.dumps(NBG).encode(),
@@ -104,6 +134,18 @@ FIXTURES = {
 # ------------------------------------------------------------------ проверки --
 
 NOW = datetime(2026, 8, 26, 8, 0, tzinfo=timezone(timedelta(hours=4)))
+
+# Блок футбола появляется только при наличии ключа — в тестах подставляем свой.
+os.environ["FOOTBALL_API_TOKEN"] = "test-key"
+
+
+def fake_football_get(url, token):
+    if not token:
+        raise AssertionError("запрос к football-data.org без ключа")
+    return FOOTBALL
+
+
+football._get = fake_football_get
 
 
 def make_fetch(lang):
@@ -191,6 +233,16 @@ def ru_checks(msg):
                                               and "<b>с тегом</b>" not in msg,
         "экранирование &": "&amp;" in msg,
         "ссылки проставлены": '<a href="https://meduza.io/a0">' in msg,
+        # футбол
+        "футбол: заголовок": "⚽️ Футбол — вчера" in msg,
+        "футбол: счёт": "Arsenal <b>2:1</b> Chelsea" in msg,
+        "футбол: нулевая ничья не потерялась": "Liverpool <b>0:0</b> Everton" in msg,
+        "футбол: турниры названы по-русски": "Лига чемпионов" in msg and "Премьер-лига" in msg,
+        "футбол: Лига чемпионов идёт первой":
+            msg.index("Лига чемпионов") < msg.index("Премьер-лига"),
+        "футбол: позавчерашний матч отброшен": "СТАРЫЙ" not in msg,
+        "футбол: недоигранный отброшен": "БЕЗ" not in msg,
+        "футбол: лишний турнир отфильтрован у нас": "ЛИШНИЙ" not in msg,
     }
 
 
@@ -214,6 +266,9 @@ def ka_checks(msg):
         "ტექნოლოგიები: ბლოკი": "ტექნოლოგიები და AI" in msg,
         "რუსული სტრიქონები არ ურევია": not re.search(r"[Дд]нём|Главное|По часам", msg),
         "ბმულები": '<a href="https://on.ge/a0">' in msg,
+        "ფეხბურთი: სათაური": "⚽️ ფეხბურთი — გუშინ" in msg,
+        "ფეხბურთი: ტურნირები ქართულად": "ჩემპიონთა ლიგა" in msg and "პრემიერ ლიგა" in msg,
+        "ფეხბურთი: ანგარიში": "Arsenal <b>2:1</b> Chelsea" in msg,
     }
 
 
@@ -507,6 +562,29 @@ def main():
     problems += p
     ka_msg, p = run("ka", ka_checks)
     problems += p
+
+    print("\n[футбол] когда ключа нет или API молчит")
+    bot.fetch = make_fetch("ru")
+    saved = os.environ.pop("FOOTBALL_API_TOKEN")
+    without = bot.build_message(lang="ru", now=NOW)
+    if "Футбол" not in without and "Тбилиси" in without:
+        print("  ✓ без ключа блок просто не появляется, сводка целая")
+    else:
+        problems.append("[футбол] без ключа блок повёл себя не так")
+    os.environ["FOOTBALL_API_TOKEN"] = saved
+
+    bot.fetch = make_fetch("ru")
+
+    def football_broken(url, token):
+        raise OSError("403 Forbidden")
+
+    football._get = football_broken
+    broken = bot.build_message(lang="ru", now=NOW)
+    football._get = fake_football_get
+    if "Футбол" not in broken and "Главное в мире" in broken:
+        print("  ✓ отказ футбольного API не рушит остальную сводку")
+    else:
+        problems.append("[футбол] отказ API уронил сводку")
 
     print("\n[доп.] крайние случаи")
 

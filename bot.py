@@ -32,6 +32,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
+try:
+    from football import football_block
+except ImportError:          # файла нет — просто не будет блока с футболом
+    football_block = None
+
 # ============================================================================
 # НАСТРОЙКИ — правьте здесь
 # ============================================================================
@@ -119,22 +124,6 @@ FEEDS = {
 
 RATE_CODES = ("USD", "EUR", "RUB")
 
-# --- футбол ---
-# Данные берутся с football-data.org: бесплатный навсегда тариф, 12 турниров,
-# 10 запросов в минуту. Ключ кладётся в секрет FOOTBALL_API_TOKEN.
-# Нет ключа — блок просто не появляется в сводке.
-#
-# Коды турниров бесплатного тарифа:
-#   CL  Лига чемпионов        PL   Премьер-лига (Англия)
-#   PD  Ла Лига (Испания)     SA   Серия A (Италия)
-#   BL1 Бундеслига            FL1  Лига 1 (Франция)
-#   PPL Примейра (Португалия) DED  Эредивизи (Нидерланды)
-#   ELC Чемпионшип (Англия)   BSA  Бразилейрао
-#   WC  Чемпионат мира        EC   Чемпионат Европы
-FOOTBALL_COMPETITIONS = ["CL", "PL", "PD", "SA", "BL1", "FL1"]
-FOOTBALL_MAX = 12          # сколько матчей показывать максимум
-FOOTBALL_HOURS_BACK = 36   # окно, за которое считаем матч «вчерашним»
-
 # ============================================================================
 # Локализация
 # ============================================================================
@@ -175,13 +164,6 @@ STRINGS = {
                  "/start — подписаться\n"
                  "/stop — отписаться\n"
                  "/lang ru | ka — язык сводки"),
-        "football": "⚽️ Футбол — вчера",
-        "competitions": {
-            "CL": "Лига чемпионов", "PL": "Премьер-лига", "PD": "Ла Лига",
-            "SA": "Серия A", "BL1": "Бундеслига", "FL1": "Лига 1",
-            "PPL": "Примейра-лига", "DED": "Эредивизи", "ELC": "Чемпионшип",
-            "BSA": "Бразилейрао", "WC": "Чемпионат мира", "EC": "Чемпионат Европы",
-        },
         "sections": {
             "world": "📰 Главное в мире",
             "georgia": "🇬🇪 Грузия",
@@ -235,13 +217,6 @@ STRINGS = {
                  "/start — გამოწერა\n"
                  "/stop — გამოწერის გაუქმება\n"
                  "/lang ru | ka — შეჯამების ენა"),
-        "football": "⚽️ ფეხბურთი — გუშინ",
-        "competitions": {
-            "CL": "ჩემპიონთა ლიგა", "PL": "პრემიერ ლიგა", "PD": "ლა ლიგა",
-            "SA": "სერია A", "BL1": "ბუნდესლიგა", "FL1": "ლიგა 1",
-            "PPL": "პრიმეირა ლიგა", "DED": "ერედივიზი", "ELC": "ჩემპიონშიპი",
-            "BSA": "ბრაზილეირაო", "WC": "მსოფლიო ჩემპიონატი", "EC": "ევროპის ჩემპიონატი",
-        },
         "sections": {
             "world": "📰 დღის მთავარი ამბები",
             "georgia": "🇬🇪 საქართველო",
@@ -516,103 +491,6 @@ def format_rates(rates, S):
 
 
 # ============================================================================
-# Футбол (football-data.org)
-# ============================================================================
-
-
-def get_football(now):
-    """Вчерашние завершённые матчи топ-лиг. Без ключа возвращает пустой список."""
-    token = os.environ.get("FOOTBALL_API_TOKEN", "").strip()
-    if not token:
-        log("[i] футбол: ключа нет (FOOTBALL_API_TOKEN), блок пропускаю")
-        return []
-
-    # Берём окно вчера–сегодня: матч, начавшийся поздно вечером, по UTC
-    # мог уже уехать на следующую дату.
-    #
-    # Фильтр по турнирам НЕ отправляем: документация /v4/matches знает только
-    # ids, date, dateFrom, dateTo и status — лишний параметр отвергается целиком.
-    # Отбираем нужные турниры уже у себя.
-    params = {
-        "dateFrom": (now - timedelta(days=1)).strftime("%Y-%m-%d"),
-        "dateTo": now.strftime("%Y-%m-%d"),
-        "status": "FINISHED",
-    }
-    url = "https://api.football-data.org/v4/matches?" + urllib.parse.urlencode(params)
-    try:
-        raw = fetch(url, headers={"X-Auth-Token": token})
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")[:200]
-        hint = {
-            400: "неверный запрос",
-            403: "ключ не даёт доступа к этим данным",
-            429: "превышен лимит запросов",
-        }.get(exc.code, "")
-        log(f"[!] футбол: HTTP {exc.code} {hint} — {body}")
-        return []
-
-    data = json.loads(raw.decode("utf-8", "replace"))
-    all_matches = data.get("matches", [])
-    log(f"[i] футбол: API вернул {len(all_matches)} завершённых матчей "
-        f"за {params['dateFrom']}–{params['dateTo']}")
-    if not all_matches:
-        return []
-
-    seen_codes = sorted({(m.get("competition") or {}).get("code") or "?"
-                         for m in all_matches})
-    log(f"[i] футбол: турниры в ответе — {', '.join(seen_codes)}; "
-        f"отбираю {', '.join(FOOTBALL_COMPETITIONS)}")
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=FOOTBALL_HOURS_BACK)
-    out = []
-    for m in all_matches:
-        comp = m.get("competition") or {}
-        code = comp.get("code") or ""
-        if FOOTBALL_COMPETITIONS and code not in FOOTBALL_COMPETITIONS:
-            continue
-        score = ((m.get("score") or {}).get("fullTime") or {})
-        if score.get("home") is None or score.get("away") is None:
-            continue
-        try:
-            when = datetime.fromisoformat((m.get("utcDate") or "").replace("Z", "+00:00"))
-        except ValueError:
-            when = None
-        if when and when < cutoff:
-            continue
-        out.append({
-            "code": code,
-            "competition": comp.get("name") or "",
-            "home": (m.get("homeTeam") or {}).get("shortName")
-                    or (m.get("homeTeam") or {}).get("name") or "?",
-            "away": (m.get("awayTeam") or {}).get("shortName")
-                    or (m.get("awayTeam") or {}).get("name") or "?",
-            "hg": score["home"],
-            "ag": score["away"],
-            "when": when,
-        })
-
-    out.sort(key=lambda x: (FOOTBALL_COMPETITIONS.index(x["code"])
-                            if x["code"] in FOOTBALL_COMPETITIONS else 99,
-                            x["when"] or datetime.min.replace(tzinfo=timezone.utc)))
-    log(f"[i] футбол: в сводку пойдёт {len(out[:FOOTBALL_MAX])} матчей")
-    return out[:FOOTBALL_MAX]
-
-
-def format_football(matches, S):
-    if not matches:
-        return None
-    lines = [f"<b>{esc(S['football'])}</b>"]
-    current = None
-    for m in matches:
-        name = S["competitions"].get(m["code"]) or m["competition"]
-        if name != current:
-            current = name
-            lines.append(f"<i>{esc(name)}</i>")
-        lines.append(f"{esc(m['home'])} <b>{m['hg']}:{m['ag']}</b> {esc(m['away'])}")
-    return "\n".join(lines)
-
-
-# ============================================================================
 # Новости
 # ============================================================================
 
@@ -779,12 +657,15 @@ def build_message(lang=DEFAULT_LANG, now=None):
         if block:
             blocks.append(block)
 
-    try:
-        block = format_football(get_football(now), S)
-        if block:
-            blocks.append(block)
-    except Exception as exc:  # noqa: BLE001
-        log(f"[!] футбол не получен: {exc}")
+    # Футбол живёт в отдельном файле football.py. Нет файла — нет блока,
+    # всё остальное работает как раньше.
+    if football_block:
+        try:
+            block = football_block(lang, now)
+            if block:
+                blocks.append(block)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[!] футбол не получен: {exc}")
 
     msg = "\n\n".join(blocks)
     if len(msg) > 4000:
@@ -1193,18 +1074,6 @@ def main(argv):
             log("Нужен TELEGRAM_BOT_TOKEN")
             return 2
         return whoami(token)
-
-    # Диагностика футбольного блока: показать, что именно отдаёт API.
-    if "--football" in argv:
-        now = datetime.now(timezone(timedelta(hours=4)))
-        matches = get_football(now)
-        if not matches:
-            print("Матчей для сводки нет. Причина — в строках выше.")
-            return 0
-        for m in matches:
-            print(f"{m['code']:>4}  {m['home']} {m['hg']}:{m['ag']} {m['away']}  "
-                  f"({m['when']:%Y-%m-%d %H:%M} UTC)")
-        return 0
 
     # Аварийный слив: выбросить всё, что накопилось у Telegram, ничего не отвечая.
     # Нужен, если backlog успел раздуться и на него не хочется реагировать вовсе.
