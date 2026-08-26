@@ -996,14 +996,18 @@ def confirm_offset(token, state):
 
 
 def broadcast(token, state, extra_chat_id=None, forced_lang=None):
-    """Рассылает сводку всем подписчикам. Возвращает (успешно, вычеркнуто)."""
+    """Рассылает сводку всем подписчикам.
+
+    Возвращает (доставлено, вычеркнуто, всего получателей). Третье число важно:
+    по нему вызывающий код отличает «рассылать было некому» от «никому не дошло».
+    """
     targets = dict(state["subscribers"])
     if extra_chat_id:
         targets.setdefault(str(extra_chat_id), {"lang": forced_lang or DEFAULT_LANG})
 
     if not targets:
         log("[i] подписчиков нет — рассылать некому")
-        return 0, 0
+        return 0, 0, 0
 
     # Сообщение собирается по разу на язык, а не на каждого получателя.
     langs = {forced_lang} if forced_lang else {
@@ -1042,7 +1046,7 @@ def broadcast(token, state, extra_chat_id=None, forced_lang=None):
                 log(f"  [!] {chat_id}: {exc}")
         time.sleep(SEND_PAUSE)
 
-    return sent, dropped
+    return sent, dropped, len(targets)
 
 
 def whoami(token):
@@ -1140,10 +1144,21 @@ def main(argv):
     forced = lang if "--lang" in argv else None
 
     state = load_state()
-    sent, dropped = broadcast(token, state, extra_chat_id=chat_id or None, forced_lang=forced)
+    sent, dropped, total = broadcast(token, state, extra_chat_id=chat_id or None,
+                                     forced_lang=forced)
     if dropped:
         save_state(state)
-    log(f"[ok] отправлено: {sent}, вычеркнуто: {dropped}")
+
+    if not total:
+        log("[ok] получателей нет: никто не нажал /start и TELEGRAM_CHAT_ID не задан")
+        return 0
+
+    log(f"[ok] доставлено {sent} из {total}, вычеркнуто: {dropped}")
+    if not sent:
+        # Раньше такой запуск завершался зелёным, и молчание бота выглядело
+        # загадкой. Теперь провал виден сразу в списке запусков.
+        log("[!] ни одно сообщение не доставлено — считаю запуск неудачным")
+        return 1
     return 0
 
 
