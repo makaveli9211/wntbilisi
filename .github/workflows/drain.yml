@@ -1,0 +1,69 @@
+name: Очистить очередь Telegram
+
+# Аварийная кнопка. Выбрасывает всё, что накопилось у Telegram, не отвечая
+# ни на одну команду, и выставляет offset за последний апдейт.
+# Запускается только вручную.
+#
+# Когда нужно: бот из-за сбоя не подтверждал обработку, backlog раздулся,
+# и на ближайшем запуске он попытается ответить на всё разом.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-bot-state
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Выбросить накопившиеся апдейты
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python bot.py --drain
+
+      - name: Сохранить offset
+        run: |
+          set -e
+          if git diff --quiet -- subscribers.json; then
+            echo "изменений нет"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git show origin/main:subscribers.json > /tmp/remote.json 2>/dev/null \
+              || echo '{}' > /tmp/remote.json
+            python bot.py --merge /tmp/remote.json
+
+            git reset --mixed origin/main >/dev/null
+            git add subscribers.json
+            if git diff --cached --quiet; then
+              echo "после слияния коммитить нечего"
+              exit 0
+            fi
+            git commit -m "Очистка очереди Telegram"
+
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push не прошёл (попытка $attempt), пробую ещё раз"
+            sleep 5
+          done
+
+          echo "не удалось сохранить offset после трёх попыток"
+          exit 1
