@@ -46,6 +46,8 @@ jobs:
           # Необязательный секрет: этот чат получает сводку всегда,
           # даже если не нажимал /start. Удобно для себя.
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Тоже необязательный: без него просто не будет блока с футболом.
+          FOOTBALL_API_TOKEN: ${{ secrets.FOOTBALL_API_TOKEN }}
         run: |
           if [ -n "${{ inputs.lang }}" ]; then
             python bot.py --lang "${{ inputs.lang }}"
