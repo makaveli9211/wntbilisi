@@ -524,24 +524,52 @@ def get_football(now):
     """Вчерашние завершённые матчи топ-лиг. Без ключа возвращает пустой список."""
     token = os.environ.get("FOOTBALL_API_TOKEN", "").strip()
     if not token:
+        log("[i] футбол: ключа нет (FOOTBALL_API_TOKEN), блок пропускаю")
         return []
 
     # Берём окно вчера–сегодня: матч, начавшийся поздно вечером, по UTC
     # мог уже уехать на следующую дату.
-    day_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    day_to = now.strftime("%Y-%m-%d")
+    #
+    # Фильтр по турнирам НЕ отправляем: документация /v4/matches знает только
+    # ids, date, dateFrom, dateTo и status — лишний параметр отвергается целиком.
+    # Отбираем нужные турниры уже у себя.
     params = {
-        "competitions": ",".join(FOOTBALL_COMPETITIONS),
-        "dateFrom": day_from,
-        "dateTo": day_to,
+        "dateFrom": (now - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "dateTo": now.strftime("%Y-%m-%d"),
         "status": "FINISHED",
     }
     url = "https://api.football-data.org/v4/matches?" + urllib.parse.urlencode(params)
-    data = json.loads(fetch(url, headers={"X-Auth-Token": token}).decode("utf-8", "replace"))
+    try:
+        raw = fetch(url, headers={"X-Auth-Token": token})
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")[:200]
+        hint = {
+            400: "неверный запрос",
+            403: "ключ не даёт доступа к этим данным",
+            429: "превышен лимит запросов",
+        }.get(exc.code, "")
+        log(f"[!] футбол: HTTP {exc.code} {hint} — {body}")
+        return []
+
+    data = json.loads(raw.decode("utf-8", "replace"))
+    all_matches = data.get("matches", [])
+    log(f"[i] футбол: API вернул {len(all_matches)} завершённых матчей "
+        f"за {params['dateFrom']}–{params['dateTo']}")
+    if not all_matches:
+        return []
+
+    seen_codes = sorted({(m.get("competition") or {}).get("code") or "?"
+                         for m in all_matches})
+    log(f"[i] футбол: турниры в ответе — {', '.join(seen_codes)}; "
+        f"отбираю {', '.join(FOOTBALL_COMPETITIONS)}")
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=FOOTBALL_HOURS_BACK)
     out = []
-    for m in data.get("matches", []):
+    for m in all_matches:
+        comp = m.get("competition") or {}
+        code = comp.get("code") or ""
+        if FOOTBALL_COMPETITIONS and code not in FOOTBALL_COMPETITIONS:
+            continue
         score = ((m.get("score") or {}).get("fullTime") or {})
         if score.get("home") is None or score.get("away") is None:
             continue
@@ -551,9 +579,8 @@ def get_football(now):
             when = None
         if when and when < cutoff:
             continue
-        comp = m.get("competition") or {}
         out.append({
-            "code": comp.get("code") or "",
+            "code": code,
             "competition": comp.get("name") or "",
             "home": (m.get("homeTeam") or {}).get("shortName")
                     or (m.get("homeTeam") or {}).get("name") or "?",
@@ -567,6 +594,7 @@ def get_football(now):
     out.sort(key=lambda x: (FOOTBALL_COMPETITIONS.index(x["code"])
                             if x["code"] in FOOTBALL_COMPETITIONS else 99,
                             x["when"] or datetime.min.replace(tzinfo=timezone.utc)))
+    log(f"[i] футбол: в сводку пойдёт {len(out[:FOOTBALL_MAX])} матчей")
     return out[:FOOTBALL_MAX]
 
 
@@ -1165,6 +1193,18 @@ def main(argv):
             log("Нужен TELEGRAM_BOT_TOKEN")
             return 2
         return whoami(token)
+
+    # Диагностика футбольного блока: показать, что именно отдаёт API.
+    if "--football" in argv:
+        now = datetime.now(timezone(timedelta(hours=4)))
+        matches = get_football(now)
+        if not matches:
+            print("Матчей для сводки нет. Причина — в строках выше.")
+            return 0
+        for m in matches:
+            print(f"{m['code']:>4}  {m['home']} {m['hg']}:{m['ag']} {m['away']}  "
+                  f"({m['when']:%Y-%m-%d %H:%M} UTC)")
+        return 0
 
     # Аварийный слив: выбросить всё, что накопилось у Telegram, ничего не отвечая.
     # Нужен, если backlog успел раздуться и на него не хочется реагировать вовсе.
