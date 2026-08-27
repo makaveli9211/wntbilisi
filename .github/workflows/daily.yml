@@ -3,21 +3,22 @@ name: Утренняя сводка в Telegram
 on:
   schedule:
     # 04:00 UTC = 08:00 в Тбилиси (Грузия круглый год UTC+4, перевода часов нет).
-    # GitHub может задержать запуск на 5–20 минут при высокой нагрузке.
+    # GitHub выполняет расписание «по возможности» и запуски пропускает —
+    # поэтому на этот cron рассылка не полагается, он лишь один из шансов.
+    # Настоящая страховка живёт в subscribe.yml, который идёт каждые 5 минут.
     - cron: "0 4 * * *"
 
-  workflow_dispatch:      # кнопка "Run workflow" для ручной проверки
+  workflow_dispatch:
     inputs:
       lang:
-        description: "Язык: пусто — у каждого подписчика свой, ru/ka — всем принудительно"
+        description: "Язык: пусто — у каждого свой, ru/ka — всем принудительно"
         type: choice
-        options: ["", ru, ka]
+        options: ["", "ru", "ka"]
         default: ""
 
 permissions:
-  contents: write        # нужен, чтобы вычеркнуть заблокировавших бота
+  contents: write
 
-# Общая группа с приёмом подписчиков: два workflow никогда не пишут в репозиторий разом.
 concurrency:
   group: telegram-bot-state
   cancel-in-progress: false
@@ -25,71 +26,68 @@ concurrency:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Подхватываем тех, кто нажал /start уже после последнего опроса,
-      # чтобы человек не ждал сводку лишние сутки.
+      # Подхватываем тех, кто нажал /start только что.
       - name: Добрать свежих подписчиков
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python bot.py --poll
 
-      - name: Разослать сводку
+      - name: Забронировать сегодняшнюю рассылку
+        id: claim
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          # Необязательный секрет: этот чат получает сводку всегда,
-          # даже если не нажимал /start. Удобно для себя.
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Тоже необязательный: без него просто не будет блока с футболом.
-          FOOTBALL_API_TOKEN: ${{ secrets.FOOTBALL_API_TOKEN }}
+          FORCED_LANG: ${{ inputs.lang }}
         run: |
-          if [ -n "${{ inputs.lang }}" ]; then
-            python bot.py --lang "${{ inputs.lang }}"
-          else
-            python bot.py
-          fi
-
-      - name: Сохранить список подписчиков
-        run: |
-          set -e
-          if git diff --quiet -- subscribers.json; then
-            echo "изменений нет"
+          # Ручной запуск шлёт всегда — им и проверяют.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ручной запуск: бронь не требуется"
             exit 0
           fi
+          python bot.py --claim-day
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Записать бронь в репозиторий
+        id: save
+        if: always()
+        run: bash .github/save-state.sh "Обновление списка подписчиков"
 
-          # Список подписчиков — генерируемый файл, текстовое слияние для него
-          # бессмысленно. Поэтому: забираем версию из репозитория, объединяем
-          # списки по смыслу и кладём результат ровно поверх удалённой ветки.
-          # Конфликт при таком порядке невозможен.
-          for attempt in 1 2 3; do
-            git fetch origin main
-            git show origin/main:subscribers.json > /tmp/remote.json 2>/dev/null \
-              || echo '{}' > /tmp/remote.json
-            python bot.py --merge /tmp/remote.json
+      # Подтверждаем обработку только после того, как offset лёг в репозиторий.
+      # Подтвердив, мы разрешаем Telegram выбросить апдейты — если сделать это
+      # до коммита и push не пройдёт, подписка исчезнет вместе с раннером.
+      - name: Подтвердить обработку апдейтов
+        if: steps.save.outcome == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python bot.py --confirm
 
-            git reset --mixed origin/main >/dev/null
-            git add subscribers.json
-            if git diff --cached --quiet; then
-              echo "после слияния коммитить нечего"
-              exit 0
-            fi
-            git commit -m "Обновление списка подписчиков"
+      # Отправляем только если бронь ДЕЙСТВИТЕЛЬНО записана в репозиторий.
+      # Не проверь мы это — непрошедший push вернул бы ту самую беду:
+      # каждый следующий запуск считал бы, что сводка ещё не уходила.
+      - name: Разослать сводку
+        if: steps.claim.outcome == 'success' && steps.save.outcome == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FOOTBALL_API_TOKEN: ${{ secrets.FOOTBALL_API_TOKEN }}
+          FORCED_LANG: ${{ inputs.lang }}
+        run: |
+          if [ -n "$FORCED_LANG" ]; then
+            # Принудительный язык — это проверка: день она не закрывает,
+            # чтобы настоящая сводка всё равно ушла каждому на своём языке.
+            python bot.py --lang "$FORCED_LANG"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python bot.py
+          else
+            python bot.py --send-now
+          fi
 
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "push не прошёл (попытка $attempt), пробую ещё раз"
-            sleep 5
-          done
-
-          echo "не удалось сохранить список после трёх попыток"
-          exit 1
+      - name: Сохранить итог рассылки
+        if: always()
+        run: bash .github/save-state.sh "Обновление списка подписчиков"
