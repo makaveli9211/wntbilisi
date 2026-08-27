@@ -51,14 +51,30 @@ HOURLY_STEP = 1        # шаг: 1 = каждый час, 2 = через час,
 HOURLY_SKIP_PAST = True  # не показывать часы, которые уже прошли
 HOURLY_SHOW_WIND = False  # добавить колонку с ветром
 
+# --- когда рассылать ---
+# Час по Тбилиси, начиная с которого сводка за сегодня считается «пора».
+# Проверка идёт при каждом опросе подписчиков, поэтому даже если GitHub
+# проглотит запуск по расписанию, сводка уйдёт на ближайшем следующем.
+SEND_HOUR = 8
+
 # --- подписчики ---
 SUBSCRIBERS_FILE = "subscribers.json"  # список хранится прямо в репозитории
+TOMBSTONE_DAYS = 60    # сколько помнить отписавшихся, чтобы их не воскресило слияние
 STORE_NAMES = False    # писать ли имена подписчиков в файл (см. раздел «Приватность» в README)
 SEND_PAUSE = 0.05      # пауза между отправками, чтобы не упереться в лимит Telegram
+BROADCAST_BUDGET_SEC = 420   # общий бюджет на рассылку
+MAX_RETRY_WAIT = 60          # сколько максимум ждать, если Telegram просит паузу
 
 # --- новости ---
-NEWS_MAX_AGE_HOURS = 30              # насколько старые заголовки ещё считаем свежими
-HTTP_TIMEOUT = 20
+NEWS_MAX_AGE_HOURS = 30   # насколько старые заголовки ещё считаем свежими
+HTTP_TIMEOUT = 12         # на одну ленту
+FETCH_RETRIES = 1         # повторов при сбое; лент много, ждать каждую долго нельзя
+NEWS_BUDGET_SEC = 100     # общий бюджет на сбор новостей за один язык
+
+# Зависшая лента раньше стоила 3 попытки по 20 секунд, а лент до четырнадцати.
+# На медленном дне это выходило за таймаут всего запуска, и рассылка обрывалась
+# на середине списка. Теперь сбор новостей укладывается в бюджет: что не успело
+# — пропускается, сводка всё равно уходит.
 
 # Сколько пунктов в каждом блоке. Поставьте 0, чтобы выключить блок целиком.
 COUNTS = {
@@ -159,6 +175,7 @@ STRINGS = {
         "bye": "Отписал. Чтобы вернуться — /start",
         "not_subscribed": "Вы и не были подписаны. /start — подписаться.",
         "lang_set": "Язык переключён на русский.",
+        "resubscribed": "Заодно вернул вас в рассылку — вы были отписаны. /stop, если это лишнее.",
         "lang_usage": "Укажите язык: /lang ru или /lang ka",
         "help": ("Я присылаю утреннюю сводку по Тбилиси: погода по часам и главные новости.\n\n"
                  "/start — подписаться\n"
@@ -212,6 +229,7 @@ STRINGS = {
         "bye": "გამოწერა გაუქმებულია. დასაბრუნებლად — /start",
         "not_subscribed": "თქვენ გამოწერილი არ იყავით. /start — გამოსაწერად.",
         "lang_set": "ენა შეიცვალა ქართულზე.",
+        "resubscribed": "ასევე დაგაბრუნეთ გამოწერაში — გამოწერილი აღარ იყავით. /stop, თუ ეს ზედმეტია.",
         "lang_usage": "მიუთითეთ ენა: /lang ru ან /lang ka",
         "help": ("გიგზავნით დილის შეჯამებას თბილისზე: საათობრივი ამინდი და მთავარი ამბები.\n\n"
                  "/start — გამოწერა\n"
@@ -278,7 +296,7 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def fetch(url, timeout=HTTP_TIMEOUT, retries=2, headers=None):
+def fetch(url, timeout=HTTP_TIMEOUT, retries=FETCH_RETRIES, headers=None):
     """GET с ретраями. Возвращает bytes или бросает исключение."""
     last = None
     ctx = ssl.create_default_context()
@@ -563,12 +581,15 @@ def norm_key(title):
     return WS_RE.sub(" ", re.sub(r"[^\w\s]", "", title.lower())).strip()[:70]
 
 
-def collect_news(section, limit, seen, lang):
+def collect_news(section, limit, seen, lang, deadline=None):
     if limit <= 0:
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=NEWS_MAX_AGE_HOURS)
     pools, stale_pools = [], []
     for url in FEEDS.get(lang, {}).get(section, []):
+        if deadline and time.monotonic() > deadline:
+            log(f"  [~] бюджет на новости исчерпан, пропускаю остаток раздела «{section}»")
+            break
         try:
             items = parse_feed(fetch(url), source_hint=urllib.parse.urlparse(url).netloc)
         except Exception as exc:  # noqa: BLE001
@@ -629,6 +650,30 @@ def format_news(section, items, S):
 # ============================================================================
 
 
+TAG_OPEN_RE = re.compile(r"<(/?)(b|i|u|s|a|pre|code)\b[^>]*>")
+
+
+def close_tags(text):
+    """Дописывает закрывающие теги, если обрезка оставила их открытыми.
+
+    Telegram отвергает сообщение с непарным тегом целиком — то есть сводку
+    не получил бы никто. Дешевле закрыть, чем потерять.
+    """
+    stack = []
+    for closing, tag in TAG_OPEN_RE.findall(text):
+        if closing:
+            if tag in stack:
+                while stack and stack.pop() != tag:
+                    pass
+        else:
+            stack.append(tag)
+    # Незакрытый <a href="..."> без ">" тоже возможен — обрубим хвост.
+    cut = text.rfind("<")
+    if cut > text.rfind(">"):
+        text = text[:cut]
+    return text + "".join(f"</{t}>" for t in reversed(stack))
+
+
 def build_message(lang=DEFAULT_LANG, now=None):
     S = STRINGS[lang]
     now = now or datetime.now(timezone(timedelta(hours=4)))
@@ -648,9 +693,10 @@ def build_message(lang=DEFAULT_LANG, now=None):
             log(f"[!] курсы не получены: {exc}")
 
     seen = set()
+    deadline = time.monotonic() + NEWS_BUDGET_SEC
     for section in ("world", "georgia", "finance", "tech"):
         log(f"Собираю раздел: {section}")
-        items = collect_news(section, COUNTS.get(section, 0), seen, lang)
+        items = collect_news(section, COUNTS.get(section, 0), seen, lang, deadline)
         block = format_news(section, items, S)
         if section == "finance" and rates_line:
             block = (block + "\n" + rates_line) if block else rates_line
@@ -667,9 +713,13 @@ def build_message(lang=DEFAULT_LANG, now=None):
         except Exception as exc:  # noqa: BLE001
             log(f"[!] футбол не получен: {exc}")
 
+    # Режем по границам блоков, а не по символам: обрыв внутри <pre> оставил бы
+    # незакрытый тег, и Telegram отверг бы сообщение целиком.
+    while len(blocks) > 1 and len("\n\n".join(blocks)) > 4000:
+        blocks.pop()
     msg = "\n\n".join(blocks)
     if len(msg) > 4000:
-        msg = msg[:3990].rsplit("\n", 1)[0] + "\n…"
+        msg = close_tags(msg[:3990].rsplit("\n", 1)[0]) + "\n…"
     return msg
 
 
@@ -679,26 +729,54 @@ def build_message(lang=DEFAULT_LANG, now=None):
 
 
 class TelegramError(RuntimeError):
-    def __init__(self, code, description):
+    def __init__(self, code, description, retry_after=None, migrate_to=None):
         super().__init__(f"Telegram API {code}: {description}")
         self.code = code
         self.description = description or ""
+        self.retry_after = retry_after      # сколько Telegram просит подождать
+        self.migrate_to = migrate_to        # новый id, если группа стала супергруппой
 
 
-def tg_api(token, method, payload):
+def tg_api(token, method, payload, retries=2):
+    """Запрос к Telegram.
+
+    Любая беда — HTTP-ответ, обрыв связи, таймаут, битый JSON — приходит наружу
+    как TelegramError. Это принципиально: рассылка ловит именно его на каждом
+    получателе, и раньше обычный обрыв соединения на середине списка выбрасывал
+    исключение мимо этой обработки и валил весь прогон.
+    """
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
         try:
-            desc = json.loads(body).get("description", body)
-        except ValueError:
-            desc = body
-        raise TelegramError(exc.code, desc) from exc
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            try:
+                payload_err = json.loads(body)
+            except ValueError:
+                payload_err = {}
+            params = payload_err.get("parameters") or {}
+            err = TelegramError(
+                exc.code,
+                payload_err.get("description", body),
+                retry_after=params.get("retry_after"),
+                migrate_to=params.get("migrate_to_chat_id"),
+            )
+            # 429 и пятисотки лечатся повтором. Раньше они летели наружу сразу,
+            # и одиночный сбой Telegram на getUpdates ронял весь шаг.
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            if retryable and attempt < retries and not err.migrate_to:
+                time.sleep(min(_int(err.retry_after, 2 + attempt), MAX_RETRY_WAIT))
+                continue
+            raise err from exc
+        except Exception as exc:  # noqa: BLE001 — обрыв, таймаут, битый ответ
+            if attempt < retries:
+                time.sleep(1 + attempt)
+                continue
+            raise TelegramError(0, f"{exc.__class__.__name__}: {exc}") from exc
 
 
 def send(token, chat_id, text):
@@ -751,9 +829,10 @@ GONE_MARKERS = (
     "user is deactivated",
     "chat not found",
     "bot was kicked",
-    "group chat was upgraded",
     "peer_id_invalid",
 )
+# «group chat was upgraded» сюда намеренно не входит: Telegram присылает
+# migrate_to_chat_id, и группу надо перевести на новый id, а не вычёркивать.
 
 
 def is_gone(exc):
@@ -768,21 +847,95 @@ def is_gone(exc):
 # ============================================================================
 
 
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def tombstone(value):
+    """Приводит надгробие к общему виду: старый формат — просто строка с датой."""
+    if isinstance(value, dict):
+        return {"at": str(value.get("at", "")), "rev": _int(value.get("rev"))}
+    return {"at": str(value), "rev": 0}
+
+
 def load_state(path=None):
+    """Читает состояние и сразу приводит его в порядок.
+
+    Файл лежит в репозитории, его правят руками и может оборвать запись.
+    Дешевле один раз нормализовать всё на входе, чем защищаться от мусора
+    в каждом месте использования — раньше кривой offset или строка вместо
+    записи подписчика роняли весь прогон.
+    """
     path = path or SUBSCRIBERS_FILE
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return {"offset": 0, "subscribers": {}}
-    data.setdefault("offset", 0)
-    data.setdefault("subscribers", {})
-    return data
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    state = {"offset": _int(data.get("offset")), "rev": _int(data.get("rev"))}
+
+    subs = data.get("subscribers")
+    state["subscribers"] = {
+        str(k): v for k, v in subs.items() if isinstance(v, dict)
+    } if isinstance(subs, dict) else {}
+
+    removed = data.get("removed")
+    if isinstance(removed, dict):
+        state["removed"] = {str(k): tombstone(v) for k, v in removed.items()}
+
+    if data.get("last_digest"):
+        state["last_digest"] = str(data["last_digest"])
+    return state
+
+
+def tbilisi_now():
+    return datetime.now(timezone(timedelta(hours=4)))
+
+
+def claim_day(state, now):
+    """Помечает сегодняшнюю рассылку как сделанную.
+
+    Возвращает (можно_рассылать, пояснение). Отметка ставится ДО отправки —
+    так повторный запуск не начнёт вторую рассылку, даже если первый упал
+    на середине.
+    """
+    today = now.strftime("%Y-%m-%d")
+    if str(state.get("last_digest") or "") == today:
+        return False, f"сводка за {today} уже отправлена"
+    if now.hour < SEND_HOUR:
+        return False, f"ещё рано: {now:%H:%M} по Тбилиси, рассылка с {SEND_HOUR}:00"
+    state["last_digest"] = today
+    return True, today
+
+
+def _key_order(key):
+    """id обычно числовой, но руками в файл может попасть что угодно —
+    на этом сортировка раньше падала и бот вставал целиком."""
+    try:
+        return (0, int(key), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(key))
 
 
 def save_state(state, path=None):
     path = path or SUBSCRIBERS_FILE
-    state["subscribers"] = dict(sorted(state["subscribers"].items(), key=lambda kv: int(kv[0])))
+    if not isinstance(state.get("subscribers"), dict):
+        state["subscribers"] = {}
+    if not isinstance(state.get("removed"), dict):
+        state.pop("removed", None)
+    state["subscribers"] = dict(sorted(state["subscribers"].items(),
+                                       key=lambda kv: _key_order(kv[0])))
+    if state.get("removed"):
+        state["removed"] = dict(sorted(state["removed"].items(),
+                                       key=lambda kv: _key_order(kv[0])))
+    else:
+        state.pop("removed", None)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=False)
         fh.write("\n")
@@ -794,19 +947,95 @@ def merge_state(local, remote):
     Нужно, когда файл успели поменять со стороны: параллельный запуск или
     правка руками. Текстовое слияние тут бессмысленно, а по смыслу всё просто —
     подписчики объединяются, наши настройки приоритетнее, offset только растёт.
-    Спорные случаи решаем в пользу того, чтобы человека не потерять.
+
+    Отдельная история — удаление. Простое объединение его отменяет: ключа,
+    которого мы только что лишились, в удалённой версии он ещё есть, и человек
+    возвращается в список. Поэтому отписки помечаются надгробиями в removed,
+    и они вычитаются из объединения.
     """
     subs = dict(remote.get("subscribers") or {})
     subs.update(local.get("subscribers") or {})
-    return {
-        "offset": max(int(local.get("offset") or 0), int(remote.get("offset") or 0)),
+    if not isinstance(remote.get("removed"), dict):
+        remote = dict(remote, removed={})
+    if not isinstance(local.get("removed"), dict):
+        local = dict(local, removed={})
+
+    removed = {str(k): tombstone(v) for k, v in (remote.get("removed") or {}).items()}
+    for key, value in (local.get("removed") or {}).items():
+        key, value = str(key), tombstone(value)
+        if value["rev"] >= removed.get(key, {"rev": -1})["rev"]:
+            removed[key] = value
+
+    # Надгробие живёт TOMBSTONE_DAYS: за это время удалённая версия точно
+    # обновится, и хранить его дальше незачем.
+    cutoff = (tbilisi_now() - timedelta(days=TOMBSTONE_DAYS)).isoformat(timespec="seconds")
+    removed = {k: v for k, v in removed.items() if v["at"] >= cutoff}
+
+    # Кто новее — подписка или надгробие? Без этого сравнения человек, нажавший
+    # /start после отписки, воскрешал бы надгробие из удалённой версии и не мог
+    # подписаться заново все 60 дней, получая при этом бодрое «вы подписаны».
+    for key in list(removed):
+        entry = subs.get(key)
+        entry_rev = _int(entry.get("rev")) if isinstance(entry, dict) else -1
+        if entry_rev > removed[key]["rev"]:
+            removed.pop(key)          # подписался позже — надгробие устарело
+        else:
+            subs.pop(key, None)
+
+    merged = {
+        "offset": max(_int(local.get("offset")), _int(remote.get("offset"))),
+        "rev": max(_int(local.get("rev")), _int(remote.get("rev"))),
         "subscribers": subs,
     }
+    if removed:
+        merged["removed"] = removed
+    # Отметку о последней рассылке берём позднюю: иначе сводка может уйти дважды.
+    stamps = [str(d["last_digest"]) for d in (local, remote) if d.get("last_digest")]
+    if stamps:
+        merged["last_digest"] = max(stamps)
+    return merged
+
+
+def stamp():
+    """Человекочитаемая метка времени — нужна только чтобы состарить надгробие."""
+    return tbilisi_now().isoformat(timespec="seconds")
+
+
+def bump(state):
+    """Номер очередного изменения состояния.
+
+    По времени подписку и отписку не упорядочить: и то и другое может прийти
+    одной пачкой в ту же секунду. Счётчик растёт при каждом изменении и живёт
+    в файле, поэтому даёт строгий порядок и внутри прогона, и между прогонами.
+    """
+    state["rev"] = _int(state.get("rev")) + 1
+    return state["rev"]
+
+
+def forget(state, chat_id):
+    """Убирает подписчика и ставит надгробие, чтобы слияние его не вернуло.
+
+    Надгробие ставится только тому, кто действительно был в списке: иначе
+    случайный недоступный чат (например, TELEGRAM_CHAT_ID) копил бы мусор
+    и потом не мог бы подписаться.
+    """
+    key = str(chat_id)
+    if state["subscribers"].pop(key, None) is None:
+        return False
+    state.setdefault("removed", {})[key] = {"at": stamp(), "rev": bump(state)}
+    return True
+
+
+def revive(state, chat_id):
+    """Снимает надгробие — человек подписался заново."""
+    (state.get("removed") or {}).pop(str(chat_id), None)
 
 
 def guess_lang(update_from):
     """Первый язык подбираем по языку клиента Telegram, дальше человек решает сам."""
-    code = ((update_from or {}).get("language_code") or "").lower()
+    if not isinstance(update_from, dict):
+        update_from = {}
+    code = str(update_from.get("language_code") or "").lower()
     if code.startswith("ka"):
         return "ka"
     if code.startswith("ru"):
@@ -826,13 +1055,27 @@ def set_lang(token, state, chat_id, lang, message_id=None, callback_id=None, ded
     """Ставит язык подписчику. Возвращает True — список изменился."""
     subs = state["subscribers"]
     key = str(chat_id)
+    resubscribed = False
+    if not isinstance(subs.get(key), dict):
+        subs.pop(key, None)
     if key in subs:
-        subs[key]["lang"] = lang
+        if subs[key].get("lang") == lang:
+            changed = False          # тот же язык — нечего сохранять и коммитить
+        else:
+            subs[key]["lang"] = lang
+            changed = True
     else:
-        # Нажал кнопку, не будучи подписанным — заодно подписываем.
-        subs[key] = {"lang": lang,
-                     "added": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+        # Нажал кнопку старого сообщения, уже будучи отписанным. Подписываем,
+        # но обязательно говорим об этом — иначе человек снова начнёт получать
+        # рассылку, которую когда-то отменил, и не поймёт почему.
+        subs[key] = {"lang": lang, "added": tbilisi_now().strftime("%Y-%m-%d"),
+                     "rev": bump(state)}
+        revive(state, chat_id)
+        changed = resubscribed = True
+
     text = STRINGS[lang]["lang_set"]
+    if resubscribed:
+        text += "\n\n" + STRINGS[lang]["resubscribed"]
     if callback_id:
         answer_callback(token, callback_id, text)
     # Переписываем то же сообщение, чтобы галочка переехала на выбранную кнопку.
@@ -843,7 +1086,7 @@ def set_lang(token, state, chat_id, lang, message_id=None, callback_id=None, ded
         if dedup is None or once(dedup, chat_id, "lang_set"):
             send_plain(token, chat_id, text, markup=lang_keyboard(lang))
     log(f"  [~] {chat_id} → язык {lang}")
-    return True
+    return changed
 
 
 def once(dedup, chat_id, tag):
@@ -861,10 +1104,18 @@ def once(dedup, chat_id, tag):
 
 def handle_command(token, state, chat_id, text, sender, chat_title=None, dedup=None):
     """Обрабатывает одну команду. Возвращает True, если список изменился."""
+    if chat_id is None:
+        return False
     dedup = dedup if dedup is not None else set()
     subs = state["subscribers"]
     key = str(chat_id)
     known = subs.get(key)
+    if known is not None and not isinstance(known, dict):
+        # Запись могли испортить руками. Считаем её отсутствующей, а не падаем:
+        # иначе одна кривая строка в файле роняла бы опрос в каждом прогоне.
+        log(f"  [~] запись {key} испорчена, перезаписываю")
+        subs.pop(key, None)
+        known = None
     lang = (known or {}).get("lang") or guess_lang(sender)
     S = STRINGS[lang]
 
@@ -874,14 +1125,18 @@ def handle_command(token, state, chat_id, text, sender, chat_title=None, dedup=N
 
     if cmd == "/start":
         if known:
-            if once(dedup, chat_id, "already"):
+            # Тег общий с приветствием: пять /start подряд дают один ответ,
+            # а не «подписаны» плюс «вы уже подписаны».
+            if once(dedup, chat_id, "start"):
                 send_plain(token, chat_id, S["already"], markup=lang_keyboard(lang))
             return False
-        entry = {"lang": lang, "added": datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+        entry = {"lang": lang, "added": tbilisi_now().strftime("%Y-%m-%d"),
+                 "rev": bump(state)}
         if STORE_NAMES:
             entry["name"] = chat_title or (sender or {}).get("first_name") or ""
         subs[key] = entry
-        if once(dedup, chat_id, "hello"):
+        revive(state, chat_id)
+        if once(dedup, chat_id, "hello") and once(dedup, chat_id, "start"):
             send_plain(token, chat_id, S["hello"], markup=lang_keyboard(lang))
         log(f"  [+] подписался {chat_id} ({lang})")
         return True
@@ -891,7 +1146,7 @@ def handle_command(token, state, chat_id, text, sender, chat_title=None, dedup=N
             if once(dedup, chat_id, "not_subscribed"):
                 send_plain(token, chat_id, S["not_subscribed"])
             return False
-        subs.pop(key, None)
+        forget(state, chat_id)
         if once(dedup, chat_id, "bye"):
             send_plain(token, chat_id, S["bye"])
         log(f"  [-] отписался {chat_id}")
@@ -933,9 +1188,13 @@ def poll(token, state):
         # нажатие кнопки выбора языка
         cb = upd.get("callback_query")
         if cb:
-            data = cb.get("data") or ""
+            data = cb.get("data")
+            if not isinstance(data, str):
+                data = ""
             msg = cb.get("message") or {}
-            chat_id = (msg.get("chat") or {}).get("id")
+            # У старых сообщений Telegram может не отдать chat — берём отправителя.
+            chat_id = ((msg.get("chat") or {}).get("id")
+                       or (cb.get("from") or {}).get("id"))
             if data.startswith("lang:") and chat_id is not None:
                 code = data.split(":", 1)[1]
                 if code in STRINGS:
@@ -956,14 +1215,14 @@ def poll(token, state):
             chat = member.get("chat") or {}
             key = str(chat.get("id"))
             if status in ("kicked", "left") and key in state["subscribers"]:
-                state["subscribers"].pop(key, None)
+                forget(state, key)
                 log(f"  [-] {key} заблокировал бота — вычеркнул")
                 changed = True
             continue
 
         msg = upd.get("message") or {}
-        text = msg.get("text") or ""
-        if not text.startswith("/"):
+        text = msg.get("text")
+        if not isinstance(text, str) or not text.startswith("/"):
             continue
         chat = msg.get("chat") or {}
         if handle_command(token, state, chat.get("id"), text,
@@ -1001,7 +1260,12 @@ def broadcast(token, state, extra_chat_id=None, forced_lang=None):
     Возвращает (доставлено, вычеркнуто, всего получателей). Третье число важно:
     по нему вызывающий код отличает «рассылать было некому» от «никому не дошло».
     """
-    targets = dict(state["subscribers"])
+    # Запись подписчика может оказаться чем угодно, если файл правили руками
+    # или обрезали при записи. Приводим к словарю здесь, чтобы одна битая
+    # строка не лишила сводки всех остальных.
+    targets = {}
+    for key, info in state["subscribers"].items():
+        targets[str(key)] = info if isinstance(info, dict) else {}
     if extra_chat_id:
         targets.setdefault(str(extra_chat_id), {"lang": forced_lang or DEFAULT_LANG})
 
@@ -1020,32 +1284,62 @@ def broadcast(token, state, extra_chat_id=None, forced_lang=None):
             log(f"Собираю сводку на языке: {lang}")
             messages[lang] = build_message(lang=lang)
 
-    sent = dropped = 0
+    sent = dropped = skipped = 0
+    deadline = time.monotonic() + BROADCAST_BUDGET_SEC
     for chat_id, info in targets.items():
+        if time.monotonic() > deadline:
+            # Иначе недоступный Telegram растягивает одного получателя на минуты,
+            # и джоб убивают по таймауту где-то посередине списка.
+            skipped += 1
+            continue
         lang = forced_lang or info.get("lang") or DEFAULT_LANG
         text = messages[lang if lang in messages else DEFAULT_LANG]
-        try:
-            send(token, chat_id, text)
-            sent += 1
-        except TelegramError as exc:
-            if exc.code == 429:
-                wait = 3
-                log(f"  [~] лимит Telegram, жду {wait}с")
-                time.sleep(wait)
-                try:
-                    send(token, chat_id, text)
-                    sent += 1
+
+        # До трёх попыток на получателя: Telegram сам говорит, сколько ждать
+        # при лимите, а сетевые сбои лечатся простым повтором. Перенос группы
+        # на новый id попыткой не считается — иначе сообщение могло потеряться.
+        attempt = migrations = 0
+        while attempt < 3:
+            try:
+                send(token, chat_id, text)
+                sent += 1
+                break
+            except TelegramError as exc:
+                if exc.migrate_to and migrations < 2:
+                    # Группа стала супергруппой — переносим подписку на новый id.
+                    old = state["subscribers"].pop(str(chat_id), None)
+                    if old is not None:
+                        state["subscribers"][str(exc.migrate_to)] = old
+                    log(f"  [~] {chat_id} → {exc.migrate_to} (группа стала супергруппой)")
+                    chat_id = exc.migrate_to
+                    migrations += 1
+                    continue                      # без attempt += 1
+                attempt += 1
+                if exc.code == 429 and attempt < 3:
+                    wait = min(_int(exc.retry_after, 3) + 1, MAX_RETRY_WAIT)
+                    log(f"  [~] лимит Telegram, жду {wait}с")
+                    time.sleep(wait)
                     continue
-                except TelegramError as exc2:
-                    exc = exc2
-            if is_gone(exc):
-                state["subscribers"].pop(str(chat_id), None)
-                dropped += 1
-                log(f"  [-] {chat_id} недоступен ({exc.description}) — вычеркнул")
-            else:
-                log(f"  [!] {chat_id}: {exc}")
+                if exc.code == 0 and attempt < 3:
+                    log(f"  [~] {chat_id}: {exc.description}, повторю")
+                    time.sleep(2)
+                    continue
+                if is_gone(exc):
+                    if forget(state, chat_id):
+                        dropped += 1
+                        log(f"  [-] {chat_id} недоступен ({exc.description}) — вычеркнул")
+                    else:
+                        log(f"  [!] {chat_id} недоступен ({exc.description})")
+                else:
+                    log(f"  [!] {chat_id}: {exc}")
+                break
+            except Exception as exc:  # noqa: BLE001 — что угодно неожиданное
+                log(f"  [!] {chat_id}: непредвиденная ошибка {exc.__class__.__name__}: {exc}")
+                break
         time.sleep(SEND_PAUSE)
 
+    if skipped:
+        log(f"  [!] бюджет рассылки исчерпан, {skipped} получателей пропущено")
     return sent, dropped, len(targets)
 
 
@@ -1077,7 +1371,11 @@ def main(argv):
         if not token:
             log("Нужен TELEGRAM_BOT_TOKEN")
             return 2
-        return whoami(token)
+        try:
+            return whoami(token)
+        except TelegramError as exc:
+            log(f"[!] {exc}")
+            return 1
 
     # Аварийный слив: выбросить всё, что накопилось у Telegram, ничего не отвечая.
     # Нужен, если backlog успел раздуться и на него не хочется реагировать вовсе.
@@ -1085,18 +1383,78 @@ def main(argv):
         if not token:
             log("Нужен TELEGRAM_BOT_TOKEN")
             return 2
-        res = tg_api(token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
-        items = res.get("result", [])
-        if not items:
-            log("[ok] очередь и так пуста")
-            return 0
-        last = items[-1]["update_id"]
-        tg_api(token, "getUpdates", {"offset": last + 1, "limit": 1, "timeout": 0})
+        try:
+            res = tg_api(token, "getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
+            items = res.get("result", [])
+            if not items:
+                log("[ok] очередь и так пуста")
+                return 0
+            last = items[-1]["update_id"]
+            tg_api(token, "getUpdates", {"offset": last + 1, "limit": 1, "timeout": 0})
+        except TelegramError as exc:
+            log(f"[!] очистить очередь не удалось: {exc}")
+            return 1
         state = load_state()
         state["offset"] = last + 1
         save_state(state)
         log(f"[ok] очередь очищена, offset выставлен на {last + 1}")
         return 0
+
+    # Бронирование дня. Отдельный режим нужен, чтобы отметку успел закоммитить
+    # шаг сохранения ДО того, как уйдут сообщения. Иначе непрошедший push
+    # означал бы, что сводка рассылается заново каждые пять минут до вечера.
+    if "--claim-day" in argv:
+        now = tbilisi_now()
+        state = load_state()
+        ok, why = claim_day(state, now)
+        if not ok:
+            log(f"[i] рассылка не нужна: {why}")
+            return 20
+        save_state(state)
+        log(f"[ok] день {why} забронирован — сводка уйдёт следующим шагом")
+        return 0
+
+    # Отправка без проверок: день уже забронирован предыдущим шагом.
+    if "--send-now" in argv:
+        if not token:
+            log("Нужен TELEGRAM_BOT_TOKEN")
+            return 2
+        state = load_state()
+        sent, dropped, total = broadcast(token, state, extra_chat_id=chat_id or None)
+        save_state(state)
+        if not total:
+            log("[ok] получателей нет")
+            return 0
+        log(f"[ok] доставлено {sent} из {total}, вычеркнуто: {dropped}")
+        return 0 if sent == total else 1
+
+    # Рассылка «если пора»: вызывается часто, но срабатывает один раз в сутки.
+    # Так сводка переживает пропущенный GitHub-ом запуск по расписанию.
+    if "--if-due" in argv:
+        if not token:
+            log("Нужен TELEGRAM_BOT_TOKEN")
+            return 2
+        now = tbilisi_now()
+        state = load_state()
+        ok, why = claim_day(state, now)
+        if not ok:
+            log(f"[i] рассылка не нужна: {why}")
+            return 0
+
+        log(f"[i] сводка за {why} ещё не уходила — рассылаю ({now:%H:%M} по Тбилиси)")
+        sent, dropped, total = broadcast(token, state, extra_chat_id=chat_id or None)
+        if not total:
+            log("[ok] получателей нет")
+            state.pop("last_digest", None)     # рассылать было некому, день не тратим
+            return 0
+        if not sent:
+            log(f"[!] доставлено 0 из {total} — отметку снимаю, попробую снова")
+            state.pop("last_digest", None)
+            save_state(state)
+            return 1
+        save_state(state)
+        log(f"[ok] доставлено {sent} из {total}, вычеркнуто: {dropped}")
+        return 0 if sent == total else 1
 
     # Слияние с версией файла из репозитория (вызывается из workflow перед коммитом).
     if "--merge" in argv:
@@ -1119,12 +1477,30 @@ def main(argv):
             return 2
         state = load_state()
         before = len(state["subscribers"])
-        if poll(token, state):
+        try:
+            changed = poll(token, state)
+        except TelegramError as exc:
+            # Не роняем шаг: иначе в том же прогоне пропустится проверка
+            # «не пора ли разослать сводку» — ровно тогда, когда Telegram
+            # барахлит. Апдейты никуда не денутся, разберём на следующем запуске.
+            log(f"[!] опрос не удался: {exc}")
+            return 0
+        if changed:
             save_state(state)
-            # Только после того, как список лёг на диск: если сохранение упадёт,
-            # апдейты останутся у Telegram и обработаются на следующем запуске.
-            confirm_offset(token, state)
         log(f"[ok] подписчиков: {before} → {len(state['subscribers'])}")
+        return 0
+
+    # Подтверждение обработки — отдельным шагом, ПОСЛЕ успешного коммита.
+    # Подтвердив, мы разрешаем Telegram выбросить апдейты у себя. Пока offset
+    # не лёг в репозиторий, этого делать нельзя: раннер уничтожается, и если
+    # push не прошёл, подписка исчезнет безвозвратно — а человеку бот уже
+    # написал «вы подписаны». Незакоммиченный offset означает лишь то, что
+    # следующий прогон разберёт те же апдейты заново.
+    if "--confirm" in argv:
+        if not token:
+            log("Нужен TELEGRAM_BOT_TOKEN")
+            return 2
+        confirm_offset(token, load_state())
         return 0
 
     lang = pick_lang(argv)
@@ -1146,7 +1522,13 @@ def main(argv):
     state = load_state()
     sent, dropped, total = broadcast(token, state, extra_chat_id=chat_id or None,
                                      forced_lang=forced)
-    if dropped:
+    if sent and not forced:
+        # Ручной запуск отмечает день, чтобы проверка в 07:00 не приводила
+        # ко второй такой же сводке в 08:00. Но запуск с принудительным языком
+        # — это именно проверка: все получили чужой язык, поэтому настоящую
+        # сводку дня он не заменяет и день не закрывает.
+        state["last_digest"] = tbilisi_now().strftime("%Y-%m-%d")
+    if sent or dropped:
         save_state(state)
 
     if not total:

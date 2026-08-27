@@ -28,9 +28,14 @@ from datetime import datetime, timedelta, timezone
 # BL1 Бундеслига, FL1 Лига 1, PPL Примейра, DED Эредивизи, ELC Чемпионшип,
 # BSA Бразилейрао, WC Чемпионат мира, EC Чемпионат Европы.
 COMPETITIONS = ["CL", "PL", "PD", "SA", "BL1", "FL1"]
-MAX_MATCHES = 12      # сколько матчей показывать максимум
-HOURS_BACK = 36       # окно, за которое считаем матч «вчерашним»
+MAX_PER_COMPETITION = 5   # чтобы один турнир не съел всю квоту
+MAX_MATCHES = 15          # общий максимум матчей в сводке
+HOURS_BACK = 36           # окно, за которое считаем матч «вчерашним»
 TIMEOUT = 20
+
+# Сводка собирается отдельно для каждого языка, а матчи от языка не зависят —
+# держим ответ API в памяти процесса, чтобы не ходить туда дважды.
+_cache = {}
 
 TITLE = {
     "ru": "⚽️ Футбол — вчера",
@@ -144,16 +149,34 @@ def get_matches(now):
 
     out.sort(key=lambda x: (COMPETITIONS.index(x["code"]) if x["code"] in COMPETITIONS else 99,
                             x["when"] or datetime.min.replace(tzinfo=timezone.utc)))
-    out = out[:MAX_MATCHES]
-    log(f"[i] футбол: в сводку пойдёт {len(out)} матчей")
-    return out
+
+    # Сначала ограничиваем каждый турнир, потом общий список. Иначе в субботу
+    # Лига чемпионов и половина АПЛ выбирали весь лимит, а остальные лиги
+    # исчезали из сводки целиком и молча.
+    per_comp, capped = {}, []
+    for m in out:
+        n = per_comp.get(m["code"], 0)
+        if n >= MAX_PER_COMPETITION:
+            continue
+        per_comp[m["code"]] = n + 1
+        capped.append(m)
+    capped = capped[:MAX_MATCHES]
+    hidden = len(out) - len(capped)
+
+    log(f"[i] футбол: в сводку пойдёт {len(capped)} матчей"
+        + (f" (ещё {hidden} не поместились)" if hidden else ""))
+    return capped
 
 
 def football_block(lang="ru", now=None):
     """Готовый HTML-блок для сводки. Пусто — значит блока не будет."""
     lang = lang if lang in TITLE else "ru"
     now = now or datetime.now(timezone(timedelta(hours=4)))
-    matches = get_matches(now)
+    day = now.strftime("%Y-%m-%d")
+    if day not in _cache:
+        _cache.clear()
+        _cache[day] = get_matches(now)
+    matches = _cache[day]
     if not matches:
         return None
 

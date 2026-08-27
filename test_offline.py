@@ -392,11 +392,18 @@ def subscription_checks(problems):
     checks = {
         "/start подписывает": "111" in subs,
         "/stop отписывает": "444" not in subs,
-        "повторный /start не дублирует": len([r for r in tg.replies.get("111", [])
-                                              if "уже подписаны" in r]) == 1,
+        "после /stop остаётся надгробие": "444" in (state.get("removed") or {}),
+        # теперь повторный /start в той же пачке не отвечает вовсе:
+        # человек получает одно приветствие, а не «подписаны» + «уже подписаны»
+        "повторный /start молчит": len([r for r in tg.replies.get("111", [])
+                                        if "уже подписаны" in r]) == 0,
+        "приветствие ровно одно": len([r for r in tg.replies.get("111", [])
+                                       if "подписаны 👋" in r]) == 1,
         "/start@имя_бота работает в группе": "333" in subs,
-        "язык угадан по клиенту Telegram": subs.get("222", {}).get("lang") == "ka"
-                                           or "222" not in subs,
+        # 222 позже заблокирует бота и выпадет из списка, поэтому язык
+        # проверяем по ответу, который он успел получить, а не по записи
+        "язык угадан по клиенту Telegram": any("გამოწერილი" in r
+                                               for r in tg.replies.get("222", [])),
         "/lang меняет язык": subs.get("333", {}).get("lang") == "ka",
         # вместо ошибки показываем кнопки, на языке собеседника (у 222 грузинский)
         "неизвестный язык показывает кнопки": (
@@ -404,7 +411,7 @@ def subscription_checks(problems):
             and not any(r == bot.STRINGS[x]["lang_set"] for x in ("ru", "ka")
                         for r in tg.replies.get("222", []))),
         "заблокировавший вычеркнут": "222" not in subs,
-        "не-команда игнорируется": "привет" not in str(tg.replies),
+        "не-команда не меняет список": "999999" not in subs,
         "offset сдвинулся": state["offset"] == 25,
         # кнопки
         "кнопка меняет язык": subs.get("111", {}).get("lang") == "ka",
@@ -448,9 +455,9 @@ def subscription_checks(problems):
 
     checks = {
         "приветствие одно": sum("подписаны 👋" in r for r in replies) == 1,
-        "«уже подписаны» один раз": sum(r == bot.STRINGS["ka"]["already"]
-                                        or r == bot.STRINGS["ru"]["already"]
-                                        for r in replies) <= 1,
+        "«уже подписаны» не приходит вовсе": not any(
+            r in (bot.STRINGS["ka"]["already"], bot.STRINGS["ru"]["already"])
+            for r in replies),
         "выбор языка предложен один раз": sum(r in (bot.STRINGS["ru"]["choose_lang"],
                                                     bot.STRINGS["ka"]["choose_lang"])
                                               for r in replies) == 1,
@@ -500,7 +507,7 @@ def subscription_checks(problems):
     bot.build_message = lambda lang=bot.DEFAULT_LANG, now=None: (
         built.append(lang) or f"СВОДКА[{lang}]")
 
-    sent, dropped = bot.broadcast("token", state, extra_chat_id="999")
+    sent, dropped, total = bot.broadcast("token", state, extra_chat_id="999")
 
     by_chat = dict(tg.sent)
     checks = {
@@ -512,11 +519,53 @@ def subscription_checks(problems):
         "успешных отправок": sent == 4,
         "заблокировавший вычеркнут": dropped == 1 and "444" not in state["subscribers"],
         "временная ошибка не вычёркивает": "555" in state["subscribers"],
+        "видно общее число получателей": total == 6,
     }
     for name, ok in checks.items():
         print(f"  {'✓' if ok else '✗'} {name}")
         if not ok:
             problems.append(f"[рассылка] провалена проверка: {name}")
+
+    print("\n[тишина] когда не дошло вообще ничего")
+    state = {"offset": 0, "subscribers": {"111": {"lang": "ru"}}}
+    tg = FakeTelegram(fail={"111": bot.TelegramError(500, "Internal Server Error")})
+    bot.tg_api = tg
+    sent, dropped, total = bot.broadcast("token", state)
+    if sent == 0 and total == 1:
+        print("  ✓ рассылка честно сообщает: получатель был, доставок ноль")
+    else:
+        problems.append(f"[тишина] broadcast вернул {sent}/{total}")
+    empty = bot.broadcast("token", {"offset": 0, "rev": 0, "subscribers": {}})
+    if empty == (0, 0, 0):
+        print("  ✓ пустой список отличим от неудачной доставки")
+    else:
+        problems.append("[тишина] пустой список неотличим от провала")
+
+    print("\n[расписание] страховка от пропущенного запуска")
+    checks = {
+        "отметка о рассылке переживает слияние":
+            bot.merge_state({"offset": 1, "subscribers": {}, "last_digest": "2026-08-27"},
+                            {"offset": 1, "subscribers": {}}).get("last_digest") == "2026-08-27",
+        "берётся более поздняя отметка":
+            bot.merge_state({"offset": 1, "subscribers": {}, "last_digest": "2026-08-26"},
+                            {"offset": 1, "subscribers": {},
+                             "last_digest": "2026-08-27"}).get("last_digest") == "2026-08-27",
+        "без отметки поле не выдумывается":
+            "last_digest" not in bot.merge_state({"offset": 1, "subscribers": {}},
+                                                 {"offset": 1, "subscribers": {}}),
+        "до часа рассылки бронь не берётся": not bot.claim_day(
+            {"subscribers": {}}, NOW.replace(hour=bot.SEND_HOUR - 1))[0],
+        "в час рассылки бронь берётся": bot.claim_day(
+            {"subscribers": {}}, NOW.replace(hour=bot.SEND_HOUR))[0],
+        "второй раз за день бронь не даётся": not bot.claim_day(
+            {"subscribers": {}, "last_digest": NOW.strftime("%Y-%m-%d")}, NOW)[0],
+        "время Тбилиси на 4 часа впереди UTC":
+            bot.tbilisi_now().utcoffset() == timedelta(hours=4),
+    }
+    for name, ok in checks.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+        if not ok:
+            problems.append(f"[расписание] провалена проверка: {name}")
 
     print("\n[файл] сохранение списка")
     import tempfile
@@ -529,7 +578,7 @@ def subscription_checks(problems):
     if not ok_roundtrip:
         problems.append("[файл] список не пережил сохранение")
     missing = bot.load_state(path=path + ".нет")
-    if missing == {"offset": 0, "subscribers": {}}:
+    if missing["subscribers"] == {} and missing["offset"] == 0:
         print("  ✓ отсутствующий файл даёт пустой список, а не падение")
     else:
         problems.append("[файл] отсутствующий файл не обработан")
@@ -543,6 +592,23 @@ def subscription_checks(problems):
         "чужие подписчики не потеряны": "333" in m["subscribers"],
         "при конфликте побеждает наша настройка": m["subscribers"]["222"]["lang"] == "ru",
         "offset берётся больший": m["offset"] == 50,
+        "надгробие не мешает вернуться": (
+            "222" in bot.merge_state(
+                {"offset": 1, "rev": 5, "subscribers": {"222": {"lang": "ru", "rev": 5}}},
+                {"offset": 1, "rev": 4, "subscribers": {},
+                 "removed": {"222": {"at": "2026-08-27T10:00:00+04:00", "rev": 4}}},
+            )["subscribers"]),
+        "свежее надгробие сильнее старой подписки": (
+            "222" not in bot.merge_state(
+                {"offset": 1, "rev": 9, "subscribers": {},
+                 "removed": {"222": {"at": "2026-08-27T10:00:00+04:00", "rev": 9}}},
+                {"offset": 1, "rev": 8, "subscribers": {"222": {"lang": "ru", "rev": 8}}},
+            )["subscribers"]),
+        "надгробие старого формата понимается": (
+            "222" not in bot.merge_state(
+                {"offset": 1, "subscribers": {}, "removed": {"222": "2026-08-27"}},
+                {"offset": 1, "subscribers": {"222": {"lang": "ru"}}},
+            )["subscribers"]),
         "затёртый вручную файл не сносит список":
             bot.merge_state(local, {"offset": 0, "subscribers": {}})["subscribers"].keys()
             == local["subscribers"].keys(),
@@ -565,6 +631,7 @@ def main():
 
     print("\n[футбол] когда ключа нет или API молчит")
     bot.fetch = make_fetch("ru")
+    football._cache.clear()          # в одном процессе матчи кэшируются
     saved = os.environ.pop("FOOTBALL_API_TOKEN")
     without = bot.build_message(lang="ru", now=NOW)
     if "Футбол" not in without and "Тбилиси" in without:
@@ -578,9 +645,11 @@ def main():
     def football_broken(url, token):
         raise OSError("403 Forbidden")
 
+    football._cache.clear()
     football._get = football_broken
     broken = bot.build_message(lang="ru", now=NOW)
     football._get = fake_football_get
+    football._cache.clear()
     if "Футбол" not in broken and "Главное в мире" in broken:
         print("  ✓ отказ футбольного API не рушит остальную сводку")
     else:
