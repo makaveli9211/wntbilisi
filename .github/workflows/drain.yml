@@ -20,7 +20,7 @@ concurrency:
 jobs:
   drain:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -34,36 +34,5 @@ jobs:
         run: python bot.py --drain
 
       - name: Сохранить offset
-        run: |
-          set -e
-          if git diff --quiet -- subscribers.json; then
-            echo "изменений нет"
-            exit 0
-          fi
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          for attempt in 1 2 3; do
-            git fetch origin main
-            git show origin/main:subscribers.json > /tmp/remote.json 2>/dev/null \
-              || echo '{}' > /tmp/remote.json
-            python bot.py --merge /tmp/remote.json
-
-            git reset --mixed origin/main >/dev/null
-            git add subscribers.json
-            if git diff --cached --quiet; then
-              echo "после слияния коммитить нечего"
-              exit 0
-            fi
-            git commit -m "Очистка очереди Telegram"
-
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "push не прошёл (попытка $attempt), пробую ещё раз"
-            sleep 5
-          done
-
-          echo "не удалось сохранить offset после трёх попыток"
-          exit 1
+        if: always()
+        run: bash .github/save-state.sh "Очистка очереди Telegram"
